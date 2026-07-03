@@ -413,15 +413,42 @@ class LocalAppliance:
         if rc != 0:
             self._restore_shared_identity(vm_name)
             return None
-
-        # Reload the agent so it connects under the freshly written unique key, then
-        # confirm the new identity actually took before correlating alerts by it.
-        self.vm.exec(vm_name, [self.WAZUH_CONTROL, "restart"])
+        # Confirm agent-auth actually wrote the unique key before relying on it.
         rc, keys, _err = self.vm.exec(vm_name, ["/bin/cat", self.WAZUH_CLIENT_KEYS])
-        if rc == 0 and agent_name in keys:
-            return agent_name
-        self._restore_shared_identity(vm_name)
-        return None
+        if not (rc == 0 and agent_name in keys):
+            self._restore_shared_identity(vm_name)
+            return None
+
+        # Bring the agent up under the new key and wait until it has actually connected
+        # to the manager. Without this the run races the manager's key reload and can
+        # forward nothing under an otherwise-valid unique identity.
+        if not self._restart_and_wait_connected(vm_name):
+            self._restore_shared_identity(vm_name)
+            return None
+        return agent_name
+
+    def _restart_and_wait_connected(self, vm_name: str) -> bool:
+        """Restart the in-guest agent and poll its log until it reports a connection to
+        the manager, re-kicking it on a fresh restart if the first attempt doesn't land
+        within the timeout (the enroll->connect race). Returns True once connected,
+        False if it never connects across all attempts (caller falls back to the shared
+        identity). The log is truncated before each restart so a stale connection line
+        from the golden's baseline agent isn't mistaken for a fresh one."""
+        import time  # noqa: PLC0415
+
+        for _ in range(self.ENROLL_CONNECT_ATTEMPTS):
+            self.vm.exec(vm_name, [f": > {self.WAZUH_LOG}"])
+            self.vm.exec(vm_name, [self.WAZUH_CONTROL, "restart"])
+            deadline = time.monotonic() + self.ENROLL_CONNECT_TIMEOUT
+            while time.monotonic() < deadline:
+                rc, out, _err = self.vm.exec(
+                    vm_name,
+                    [f"grep -c 'Connected to the server' {self.WAZUH_LOG} 2>/dev/null || true"],
+                )
+                if rc == 0 and out.strip() not in ("", "0"):
+                    return True
+                time.sleep(self.ENROLL_CONNECT_INTERVAL)
+        return False
 
     def _restore_shared_identity(self, vm_name: str) -> None:
         """Put the baked `client.keys` back and reload the agent, so a failed unique
@@ -492,6 +519,19 @@ class LocalAppliance:
     WAZUH_AGENT_AUTH = "/Library/Ossec/bin/agent-auth"
     WAZUH_CLIENT_KEYS = "/Library/Ossec/etc/client.keys"
     WAZUH_OSSEC_CONF = "/Library/Ossec/etc/ossec.conf"
+    WAZUH_LOG = "/Library/Ossec/logs/ossec.log"
+
+    # After enrolling a unique agent we must WAIT until it has actually connected to
+    # the manager before relying on it to forward — enroll-then-restart races the
+    # manager's remoted key reload, and the agent's own reconnect backoff can be a full
+    # minute, longer than a detonation window. Poll the guest's ossec.log for a fresh
+    # "Connected to the server", and re-kick the agent (a fresh restart forces an
+    # immediate attempt, by which time remoted has the key) rather than wait out that
+    # backoff. Verified live: one enrolled clone forwarded zero alerts while its
+    # neighbors forwarded normally, exactly this race.
+    ENROLL_CONNECT_TIMEOUT = 20.0
+    ENROLL_CONNECT_INTERVAL = 2.0
+    ENROLL_CONNECT_ATTEMPTS = 3
 
     def _revert_live(self, profile: str) -> None:
         """Delete the per-run clones for this profile; the golden image is untouched,

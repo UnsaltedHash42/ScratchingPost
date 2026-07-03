@@ -137,6 +137,11 @@ class EnrollFakeVm(FakeVm):
         if argv and argv[0].startswith("grep -oE '<address>"):
             self.calls.append(("exec", vm, argv))
             return (0, self.manager + "\n", "")
+        # The post-enrollment connection wait polls ossec.log; report connected at once
+        # so unit tests don't incur the real connect-wait timeout.
+        if argv and argv[0].startswith("grep -c 'Connected to the server'"):
+            self.calls.append(("exec", vm, argv))
+            return (0, "1\n", "")
         # The enrollment verify cats client.keys (distinct from the raw-capture cat).
         if argv and argv[0] == "/bin/cat" and argv[-1].endswith("client.keys"):
             self.calls.append(("exec", vm, argv))
