@@ -1,0 +1,133 @@
+<!--
+  ScratchingPost -> Wazuh custom ruleset (MODULE_CONTRACT.md §7, ARCHITECTURE.md §9).
+
+  The ESF telemetry Wazuh cannot collect on macOS comes from ScratchingPost's own
+  recorder, piped into the manager as a custom log source (see ossec.conf.snippet).
+  Each event is one uniform-schema JSON object per line (orchestrator Event.to_dict:
+  top-level `event_type`, nested `process.*` code-identity, `payload.*`), decoded by
+  Wazuh's built-in JSON decoder — so rules address fields by dotted name.
+
+  Local rule ids use the 100000+ range Wazuh reserves for user rules. Rule levels
+  follow Wazuh's 0-15 scale; 12+ is high-importance (maps to ScratchingPost HIGH in
+  modules/dispatch/wazuh.py:alert_to_severity). Every attack rule carries its MITRE
+  technique id(s) in the native <mitre> idiom, which the dispatch module reads back
+  from rule.mitre.id and attaches to the Indicator.
+-->
+<group name="scratchingpost,esf,">
+
+  <!-- Base rule: a ScratchingPost ESF event. Scoped to our taxonomy so unrelated
+       JSON logs on the same manager don't chain off it. level 0 = no alert on its
+       own; the detection rules below raise it. -->
+  <rule id="100000" level="0">
+    <decoded_as>json</decoded_as>
+    <field name="event_type">^exec$|^fork$|^exit$|^file_create$|^file_write$|^file_rename$|^file_unlink$|^mmap$|^mprotect$|^signal$|^ptrace$|^get_task$|^cs_invalidated$|^btm_launch_item_add$|^xprotect$|^tcc_modify$|^script_exec$|^dylib_load$</field>
+    <description>ScratchingPost ESF telemetry event</description>
+    <options>no_full_log</options>
+  </rule>
+
+  <!-- Task-port acquisition: the surviving macOS injection primitive (task_for_pid
+       -> mach_vm_write -> remote thread). -->
+  <rule id="100001" level="12">
+    <if_sid>100000</if_sid>
+    <field name="event_type">^get_task$</field>
+    <description>Task port acquired (process injection primitive): $(process.path)</description>
+    <mitre>
+      <id>T1055</id>
+    </mitre>
+    <group>injection,</group>
+  </rule>
+
+  <!-- ptrace attach: anti-debug and the classic injection/anti-analysis path. -->
+  <rule id="100002" level="12">
+    <if_sid>100000</if_sid>
+    <field name="event_type">^ptrace$</field>
+    <description>ptrace attach (anti-debug / injection): $(process.path)</description>
+    <mitre>
+      <id>T1055.008</id>
+      <id>T1622</id>
+    </mitre>
+    <group>injection,anti_debug,</group>
+  </rule>
+
+  <!-- Runtime code-signature invalidation: unsigned/tampered code executing. -->
+  <rule id="100003" level="12">
+    <if_sid>100000</if_sid>
+    <field name="event_type">^cs_invalidated$</field>
+    <description>Code signature invalidated at runtime (tampering): $(process.path)</description>
+    <mitre>
+      <id>T1553</id>
+    </mitre>
+    <group>signature,</group>
+  </rule>
+
+  <!-- Persistence as a first-class ESF event (BTM launch-item add): LaunchAgent /
+       LaunchDaemon / login item, no path-heuristic guessing. -->
+  <rule id="100004" level="12">
+    <if_sid>100000</if_sid>
+    <field name="event_type">^btm_launch_item_add$</field>
+    <description>Background task management launch item added (persistence)</description>
+    <mitre>
+      <id>T1543</id>
+      <id>T1547</id>
+    </mitre>
+    <group>persistence,</group>
+  </rule>
+
+  <!-- Apple's own detection firing inside the guest: known-malware conviction. -->
+  <rule id="100005" level="15">
+    <if_sid>100000</if_sid>
+    <field name="event_type">^xprotect$</field>
+    <description>Apple XProtect malware detection fired in the detonation guest</description>
+    <group>malware,</group>
+  </rule>
+
+  <!-- Interpreter / script execution (the AMSI-gap fill: osascript/JXA and friends). -->
+  <rule id="100006" level="8">
+    <if_sid>100000</if_sid>
+    <field name="event_type">^script_exec$</field>
+    <description>Script/interpreter execution: $(process.path)</description>
+    <mitre>
+      <id>T1059</id>
+      <id>T1059.002</id>
+    </mitre>
+    <group>execution,</group>
+  </rule>
+
+  <!-- Persistence by dropping into the launch-item directories. Split so the ATT&CK
+       sub-technique is exact (agent vs daemon). -->
+  <rule id="100010" level="12">
+    <if_sid>100000</if_sid>
+    <field name="event_type">^file_create$|^file_write$|^file_rename$</field>
+    <field name="payload.path">LaunchAgents/</field>
+    <description>File written to a LaunchAgents directory (persistence): $(payload.path)</description>
+    <mitre>
+      <id>T1543.001</id>
+    </mitre>
+    <group>persistence,</group>
+  </rule>
+
+  <rule id="100011" level="12">
+    <if_sid>100000</if_sid>
+    <field name="event_type">^file_create$|^file_write$|^file_rename$</field>
+    <field name="payload.path">LaunchDaemons/</field>
+    <description>File written to a LaunchDaemons directory (persistence): $(payload.path)</description>
+    <mitre>
+      <id>T1543.004</id>
+    </mitre>
+    <group>persistence,</group>
+  </rule>
+
+  <!-- The detonated payload executing without a valid signature. Modest level (this
+       fires on the sample's own exec, corroborating rather than convicting). -->
+  <rule id="100020" level="6">
+    <if_sid>100000</if_sid>
+    <field name="event_type">^exec$</field>
+    <field name="process.signature_type">^unsigned$|^adhoc$</field>
+    <description>Unsigned/adhoc binary executed: $(process.path)</description>
+    <mitre>
+      <id>T1553</id>
+    </mitre>
+    <group>signature,execution,</group>
+  </rule>
+
+</group>

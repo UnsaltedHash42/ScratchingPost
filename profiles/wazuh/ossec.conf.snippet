@@ -1,0 +1,23 @@
+<!--
+  ScratchingPost ESF telemetry as a Wazuh custom log source (ARCHITECTURE.md §9,
+  MODULE_CONTRACT.md §7). Wazuh has no ESF sensor on macOS, so the behavioral stream
+  comes from ScratchingPost's recorder and enters Wazuh here.
+
+  Installed inside <ossec_config> of the Wazuh AGENT baked into the `wazuh` detonation
+  golden (guest). IMPORTANT: this is fed the UNIFORM Event schema, which stock
+  `eslogger` does NOT emit — its raw ES output uses a numeric `event_type` and
+  `process.executable.path`, matching none of local_rules.xml. The detonation seam runs
+  stock eslogger in the guest, converts the raw capture to the uniform schema host-side
+  (sensors.eslogger.parser -> Event.to_dict), and pushes the result back into the clone
+  at the <location> below (LocalAppliance.agent_ingest_path). The in-guest agent then
+  tails it and forwards to the manager, so alerts attribute to the real guest agent and
+  the custom rules fire. <log_format>json</log_format> engages Wazuh's built-in JSON
+  decoder so local_rules.xml addresses fields by dotted name (event_type, process.*,
+  payload.*). The push is one JSON object per line; <location> must equal
+  LocalAppliance.agent_ingest_path.
+-->
+<localfile>
+  <log_format>json</log_format>
+  <location>/var/log/scratchingpost/events.jsonl</location>
+  <label key="scratchingpost.source">esf-recorder</label>
+</localfile>

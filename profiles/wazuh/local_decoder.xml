@@ -1,0 +1,23 @@
+<!--
+  ScratchingPost -> Wazuh custom decoder (MODULE_CONTRACT.md §7).
+
+  Ingestion is JSON-first. The recorder writes one uniform-schema JSON object per
+  line; the manager reads that file with <log_format>json</log_format> (see
+  ossec.conf.snippet) and Wazuh's BUILT-IN json decoder extracts every field. On
+  that path no custom decoder is needed and rule 100000 keys on <decoded_as>json</>.
+
+  This custom decoder covers the ALTERNATIVE transport: some agent setups ship the
+  ESF stream as syslog-tagged lines ("scratchingpost: {json...}") rather than a file
+  the manager tails directly. There the built-in json decoder never sees a bare JSON
+  line, so we match the program tag and hand the remaining body to the JSON_Decoder
+  plugin. If you use this path, change rule 100000's <decoded_as>json</decoded_as>
+  to <decoded_as>scratchingpost-esf</decoded_as>.
+-->
+<decoder name="scratchingpost-esf">
+  <program_name>^scratchingpost$</program_name>
+</decoder>
+
+<decoder name="scratchingpost-esf-json">
+  <parent>scratchingpost-esf</parent>
+  <plugin_decoder offset="after_parent">JSON_Decoder</plugin_decoder>
+</decoder>

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scratchingpost"
+version = "0.1.0"
+description = "macOS payload-analysis sandbox (LitterBox counterpart): static/behavioral/detection tiers into a Detection Score"
+requires-python = ">=3.11"
+dependencies = [
+    "lief>=0.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+# Live Apple-builtin emulation tier: compiles Apple's on-disk XProtect YARA.
+# The module is fully usable without this via an injected matcher (offline/tests).
+yara = ["yara-python>=4.5"]
+
+[tool.setuptools]
+# Three top-level packages matching the docs' repo layout (ARCHITECTURE.md,
+# ROADMAP.md Phase 0). Kept as separate packages so each tier is independently
+# testable; modules/ and sensors/ import the contracts from orchestrator/.
+packages = [
+    "orchestrator",
+    "orchestrator.contracts",
+    "orchestrator.pipeline",
+    "orchestrator.detonation",
+    "modules",
+    "modules.static",
+    "modules.emulation",
+    "modules.dispatch",
+    "sensors",
+    "sensors.eslogger",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
