@@ -1,4 +1,46 @@
-# ScratchingPost — Handoff (end of 2026-07-02, session 7)
+# ScratchingPost — Handoff (end of 2026-07-02, session 8)
+
+## What shipped this session (session 8) — per-clone unique agent enrollment (BUILT, OFF by default)
+
+Chose candidate step 1 from the session-7 handoff (per-clone unique agent enrollment, the
+"durable fix" for the shared-id-001 collision). It is **built, unit-tested (107→113 green),
+and proven in isolation, but shipped OFF by default** because it is not yet reliable in this
+lab. The reliable path (shared identity + graceful-stop + one-time session-start manager
+restart) is unchanged and remains the default — no regression.
+
+- **What it does:** `LocalAppliance(unique_enrollment=True)` (default **False**) enrolls each
+  dispatch clone as its OWN Wazuh agent over exec — `agent-auth -m <manager from the guest's
+  own ossec.conf> -A scratchingpost-<clone-uuid>` — with a safe fallback to the shared identity
+  on any failure. `WazuhModule` correlates the run's alerts by that per-run name via the new
+  `LocalAppliance.agent_name_for(run_id)` (duck-typed; falls back to the configured agent).
+  No golden rebuild (tooling is already baked). New method `_enroll_unique_agent` +
+  `_restart_and_wait_connected`; unit tests in `tests/test_detonation_api.py`.
+- **Two real bugs found and fixed en route** (both live-diagnosed via the manager's authd/remoted
+  log + `wazuh-agentd.state`):
+  1. **Name must be the clone uuid, not run_id.** run_id is deterministic
+     (`fnv1a(sha256:profile:counter)`), so repeat runs of a sample requested the SAME agent name
+     and **authd rejected the duplicate** ("Agent 'NNN' can't be replaced since it is not
+     disconnected") — this was the dominant cause of the "random" forward failures.
+  2. **Confirm the MANAGER ack, not the agent's log.** The agent logs "Connected to the server"
+     on TCP connect, but remoted drops its messages until it reloads the just-registered key.
+     `_restart_and_wait_connected` polls `wazuh-agentd.state` for a real `last_ack`
+     (manager-confirmed) and re-kicks the agent on the reload race.
+- **Why it's off (the wall):** even after both fixes, ~1 live run in 3 still fails — the enrolled
+  agent shows **"Never connected"** on the manager and forwards nothing. Root cause is
+  environmental: every Parallels clone NATs to the **Dockerized** manager through ONE source IP
+  (`192.168.65.1`), and remoted intermittently rejects an agent from that shared IP ("Invalid ID
+  N for source ip ..."). Preempting id 001's boot connection (`wazuh-control stop` at enroll start
+  so the unique agent claims the IP first) reduced but did not eliminate it. **The durable fix is
+  per-clone routable identity** (bridged per-clone networking, or a non-Dockerized manager so each
+  guest reaches remoted as itself), which is infra work — not more guest-side retry. Enable
+  `unique_enrollment=True` only in an env without the shared-source-IP race.
+- **Detection is NOT the issue** — proven again live this session: when a run's unique agent does
+  connect, persist trips 100010, inject trips 100001, adhoc trips 100020 (scoped captures fire the
+  rules via `wazuh-logtest`). Only the enroll→forward channel is flaky under the shared-IP race.
+- **Lab left clean:** manager daemons restarted + all run-agents removed (only `001
+  scratchingpost-wazuh.shared` remains), both goldens stopped, no run clones, Wazuh stack UP.
+
+## Session 7 (end of 2026-07-02)
 
 **State:** Phase 1 + Phase 1.5 conductor + Phase 2 Wazuh dispatch tier, ESF→Wazuh wired
 end-to-end — and as of session 7 the sandbox **convicts both persistence AND injection behavior**,
@@ -220,44 +262,47 @@ skipped.**
   rules can't fire until the ESF custom log source is in the golden (GUI-gated), so a malicious
   sample would only trip Wazuh's native macOS checks — no new signal. Do it after step 1 of Next.
 
-## Next-session kickoff prompt (paste to start session 8)
-> ScratchingPost — session 8. Read HANDOFF.md (end of 2026-07-02 session 7) — esp. the
-> session-7 section above — the docs/ROADMAP.md "Where it actually stands, and what's shaky"
-> section (limitation 2 [now closed for self-acting behavior: persistence AND injection] + 3 [done]
-> + the two reliability fixes), docs/ARCHITECTURE.md §6/§7/§9, samples/behavior/README.md,
-> profiles/wazuh/README.md, and the project-status + wazuh-dispatch-reliability +
+## Next-session kickoff prompt (paste to start session 9)
+> ScratchingPost — session 9. Read HANDOFF.md (end of 2026-07-02 session 8) — esp. the
+> session-8 section above — the docs/ROADMAP.md "Where it actually stands, and what's shaky"
+> section, docs/ARCHITECTURE.md §6/§7/§9, samples/behavior/README.md, profiles/wazuh/README.md
+> (unique_enrollment section), and the project-status + wazuh-dispatch-reliability +
 > build-working-app-not-tests + mythic-real-agent-state memories. Docs are authoritative.
-> Tests: /opt/homebrew/anaconda3/bin/python3 -m pytest -q — 107 passed + 6 skipped (offline; the
-> 3 live E2E among the skips pass when run with the live env below).
+> Tests: /opt/homebrew/anaconda3/bin/python3 -m pytest -q — 113 passed + 6 skipped (offline; the
+> 3 live E2E among the skips pass when the manager is clean, env below).
 >
 > Behavior detection is PROVEN for BOTH persistence and injection, live end to end via the wired +
-> subtree-scoped + clock-synced path: samples/behavior/persist_launchagent → rule 100010 (T1543.001);
-> samples/behavior/inject_taskport (adhoc arm64, self-acting) forks a child and task_for_pid's it →
-> ESF get_task (subject = the sample, so subtree scoping keeps it) → rule 100001 (T1055, level 12) →
-> indexer → dispatch → score. Both live-gated E2Es in tests/test_wazuh_e2e.py. Build the samples with
-> samples/behavior/build.sh; run the E2Es with the usual env (SCRATCHINGPOST_WAZUH_E2E=1,
-> WAZUH_INDEXER_URL=https://wazuh.indexer:9200, WAZUH_INDEXER_CA=.../root-ca.pem,
-> WAZUH_INDEXER_RESOLVE=wazuh.indexer=127.0.0.1, WAZUH_E2E_AGENT=scratchingpost-wazuh.shared).
-> IMPORTANT (Blake): build a WORKING APP, verify against real detonations, not just green tests.
+> subtree-scoped + clock-synced path (shared-identity, the DEFAULT): persist_launchagent → 100010
+> (T1543.001); inject_taskport → 100001 (T1055); adhoc → 100020 (T1553). E2Es in
+> tests/test_wazuh_e2e.py; env: SCRATCHINGPOST_WAZUH_E2E=1, WAZUH_INDEXER_URL=https://
+> wazuh.indexer:9200, WAZUH_INDEXER_CA=~/tools/wazuh-docker/single-node/config/
+> wazuh_indexer_ssl_certs/root-ca.pem, WAZUH_INDEXER_RESOLVE=wazuh.indexer=127.0.0.1,
+> WAZUH_E2E_AGENT=scratchingpost-wazuh.shared. Detection/scoping are solid; the flaky part is
+> only the enroll→forward channel (see below). IMPORTANT (Blake): build a WORKING APP, verify
+> against real detonations, not just green tests.
 >
-> RELIABILITY GOTCHA seen twice now: a stale remoted connection for shared agent id 001 (all clones
-> reuse the golden's client.keys) silently zeroes the dispatch tier — the clone's agent is refused, no
-> 503, nothing forwards, detection looks broken though rules fire (confirm via wazuh-logtest on the
-> retained scoped capture in $TMPDIR/scratchingpost-runs/<run_id>/events.scoped.jsonl). Within-session
-> serial runs are handled by the graceful-stop-before-delete fix, but a stale id inherited at session
-> start needs a one-time `docker exec single-node-wazuh.manager-1 /var/ossec/bin/wazuh-control restart`
-> before the first live run. If a live E2E returns 0 dispatch indicators, check this FIRST.
+> RELIABILITY GOTCHA (still the operational rule for the DEFAULT shared path): a stale remoted
+> connection for shared agent id 001 zeroes the dispatch tier. If a live E2E returns 0 dispatch
+> indicators, restart the manager daemons FIRST (`docker exec single-node-wazuh.manager-1
+> /var/ossec/bin/wazuh-control restart`), then re-run; diagnose detection separately via
+> wazuh-logtest on the retained scoped capture ($TMPDIR/scratchingpost-runs/<run_id>/
+> events.scoped.jsonl).
+>
+> Session 8 built per-clone UNIQUE agent enrollment (candidate step 1) but it is OFF by default
+> (`LocalAppliance.unique_enrollment=False`) — blocked by a NAT-single-IP remoted race (~1 run in
+> 3 the enrolled agent "Never connected"; all clones NAT to the Dockerized manager through
+> 192.168.65.1). The durable fix is per-clone routable identity (bridged networking / non-Dockerized
+> manager), i.e. INFRA, not more guest code. See the wazuh-dispatch-reliability memory. Do NOT
+> re-attempt guest-side enrollment retry — it won't fix the shared-IP root cause.
 >
 > Candidate next steps (pick one, don't build ahead):
->   1. [durable, removes the gotcha at the root] Per-clone UNIQUE agent enrollment. The golden already
->      has authd fallback (a clone auto-registers as a new agent under its own hostname on a key
->      collision — we saw agent 002). Make every clone enroll uniquely and have WazuhModule correlate
->      by the run's own agent name (not the shared name), so back-to-back runs never collide and the
->      manager restart is never needed. Golden-provisioning work but the highest-value reliability win.
+>   1. [needs infra — enables the unique-enrollment win already built] Give each clone a routable
+>      identity to the manager: bridged per-clone networking, or run the Wazuh manager natively
+>      (not Docker) so guests reach remoted as themselves. Then flip unique_enrollment=True and the
+>      shared-id collision is gone for good. Infra/networking work, not app code.
 >   2. [needs infra] Live-callback / interactive detonation mode: task a Poseidon beacon to inject /
->      persist on command (rules that need a real implant to *act*). Needs the Mythic http listener
->      (roshar) reachable from the guest LAN + a window longer than 12 s (keep the clone alive, beacon
->      out, task, capture). Deferred since session 6 for lack of a reachable listener.
+>      persist on command. Needs the Mythic http listener (roshar) reachable from the guest LAN +
+>      a window longer than 12 s. Deferred since session 6 for lack of a reachable listener.
 >   3. Custom ESF sysext (durable fix for boot-storm event drops) — still GUI-blocked
 >      (systemextensionsctl developer on); needs an interactive guest session.
 > Do NOT start Elastic emulation, mach_vm scanner, web UI, MCP, or commercial EDR profiles. Keep

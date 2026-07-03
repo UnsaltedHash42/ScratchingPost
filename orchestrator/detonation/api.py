@@ -111,7 +111,7 @@ class LocalAppliance:
         agent_ingest_settle: float = 20.0,
         detonate_settle: float = 0.0,
         eslogger_start_delay: float = 0.0,
-        unique_enrollment: bool = True,
+        unique_enrollment: bool = False,
         enrollment_password: str | None = None,
     ) -> None:
         self.capture_resolver = capture_resolver
@@ -149,15 +149,21 @@ class LocalAppliance:
         # write/mmap/mprotect/signal firehose) so the pushed capture is a few hundred KB.
         self.detonate_settle = detonate_settle
         self.eslogger_start_delay = eslogger_start_delay
-        # Dispatch (wazuh) profiles: enroll each clone as its OWN unique Wazuh agent
-        # (via `agent-auth`) instead of reusing the golden's baked identity (agent id
-        # 001, `scratchingpost-wazuh.shared`). Every clone sharing id 001 was the root
-        # of a reliability trap — a stale remoted connection for 001 silently refused
-        # the next clone, zeroing the dispatch tier until a manual manager restart (see
-        # the wazuh-dispatch-reliability memory). A unique identity per run removes the
-        # collision entirely, so back-to-back runs never need the restart. Best-effort
-        # with a safe fallback: if enrollment can't complete (no manager address, authd
-        # unreachable), the clone keeps the shared identity and still forwards. Gated on
+        # Dispatch (wazuh) profiles: OPTIONALLY enroll each clone as its OWN unique
+        # Wazuh agent (via `agent-auth`) instead of reusing the golden's baked identity
+        # (agent id 001, `scratchingpost-wazuh.shared`). A unique identity per run would
+        # remove the shared-id-001 collision at its root and drop the one-time
+        # session-start manager restart the shared path needs (wazuh-dispatch-reliability
+        # memory). It registers, correlates, and forwards correctly in isolation, BUT it
+        # is **off by default and not yet reliable in this lab**: every clone NATs to the
+        # Dockerized manager through ONE source IP, and remoted intermittently (~1 run in
+        # 3) rejects a freshly-enrolled agent from that shared IP — it never connects and
+        # forwards nothing, which is worse than the proven shared path. Preempting id
+        # 001's boot connection (`_enroll_unique_agent`) reduced but did not eliminate it;
+        # the blocker is environmental (single source IP), so the durable fix is per-clone
+        # routable identity (bridged networking / a non-Dockerized manager), not more
+        # guest-side retry. Enable only in an env without the shared-source-IP race. When
+        # off, the run keeps the golden's shared identity (the reliable path). Gated on
         # the dispatch path (`agent_ingest_path`); the apple path never runs an agent.
         self.unique_enrollment = unique_enrollment
         # Optional authd registration password (`agent-auth -P`); None when the manager
@@ -309,7 +315,7 @@ class LocalAppliance:
             # a prior run on the shared golden identity (id 001). Best-effort: on any
             # failure it keeps the baked identity and forwards under that instead.
             if self.unique_enrollment:
-                agent_name = self._enroll_unique_agent(vm_name, run_id)
+                agent_name = self._enroll_unique_agent(vm_name)
         if self.detonate_settle > 0:
             import time  # noqa: PLC0415
 
@@ -372,7 +378,7 @@ class LocalAppliance:
         stamp = time.strftime("%Y%m%d%H%M.%S", time.gmtime())
         self.vm.exec(vm_name, ["/bin/date", "-u", stamp])
 
-    def _enroll_unique_agent(self, vm_name: str, run_id: str) -> "str | None":
+    def _enroll_unique_agent(self, vm_name: str) -> "str | None":
         """Register this clone as its own unique Wazuh agent and return the name it
         enrolled under, or None to fall back to the golden's shared identity.
 
@@ -382,13 +388,21 @@ class LocalAppliance:
         and the dispatch tier forwards nothing (the wazuh-dispatch-reliability trap).
         Registering a fresh unique agent per run removes the collision at its root.
 
+        The name is derived from the clone's uuid (`vm_name` is `<golden>-<uuid4hex>`),
+        NOT the run_id — run_id is deterministic (`fnv1a(sha256:profile:counter)`), so
+        two runs of the same sample would request the SAME name and authd rejects the
+        second as a duplicate ("Agent 'NNN' can't be replaced since it is not
+        disconnected") until the prior agent ages out. The clone uuid is unique per run,
+        so enrollment always gets a fresh name (verified live: the duplicate-name
+        rejection was exactly why repeat runs of a sample forwarded nothing).
+
         Driven entirely over `exec` with tooling already in the golden (`agent-auth`),
         so no golden rebuild is needed. Reads the manager address from the guest's own
         `ossec.conf` (robust to the manager's DHCP address changing) rather than
         hardcoding it. Best-effort and reversible: the baked key is backed up first, so
         a failed registration restores the shared identity (which still forwards) rather
         than leaving the clone with no key (which would forward nothing)."""
-        agent_name = f"scratchingpost-{run_id}"
+        agent_name = f"scratchingpost-{vm_name.rsplit('-', 1)[-1]}"
 
         rc, out, _err = self.vm.exec(
             vm_name,
@@ -397,6 +411,15 @@ class LocalAppliance:
         manager = out.strip() if rc == 0 else ""
         if not manager:
             return None  # no manager address -> can't reach authd; keep shared identity
+
+        # Stop the agent BEFORE it connects under the golden's baked id 001. Every clone
+        # NATs to the manager through one source IP, and remoted associates that IP with
+        # whichever agent connects first; if id 001 connects at boot it claims the IP and
+        # remoted then rejects the freshly-enrolled unique agent from the same IP
+        # ("Invalid ID N for source ip ...") — the agent never connects and forwards
+        # nothing. Enrollment runs seconds after boot, before id 001's ~20-35 s connect,
+        # so stopping here preempts that claim and lets the unique agent own the IP.
+        self.vm.exec(vm_name, [self.WAZUH_CONTROL, "stop"])
 
         # Back up the baked key so a failed enrollment degrades to the shared identity,
         # then truncate it: `agent-auth` writes the new key, and starting from an empty
@@ -428,27 +451,39 @@ class LocalAppliance:
         return agent_name
 
     def _restart_and_wait_connected(self, vm_name: str) -> bool:
-        """Restart the in-guest agent and poll its log until it reports a connection to
-        the manager, re-kicking it on a fresh restart if the first attempt doesn't land
-        within the timeout (the enroll->connect race). Returns True once connected,
-        False if it never connects across all attempts (caller falls back to the shared
-        identity). The log is truncated before each restart so a stale connection line
-        from the golden's baseline agent isn't mistaken for a fresh one."""
+        """Restart the in-guest agent and poll until the MANAGER acknowledges it
+        (`wazuh-agentd.state`: `status='connected'` with a real `last_ack`), re-kicking
+        it on a fresh restart if the manager hasn't acked within the timeout (the
+        enroll->reload race). Returns True once acked, False if the manager never acks
+        across all attempts (caller falls back to the shared identity)."""
         import time  # noqa: PLC0415
 
         for _ in range(self.ENROLL_CONNECT_ATTEMPTS):
-            self.vm.exec(vm_name, [f": > {self.WAZUH_LOG}"])
+            # Drop the stale state file so we only read the fresh agent's status; the
+            # restarted agentd recreates it within a couple of seconds.
+            self.vm.exec(vm_name, [f"rm -f {self.WAZUH_STATE}"])
             self.vm.exec(vm_name, [self.WAZUH_CONTROL, "restart"])
             deadline = time.monotonic() + self.ENROLL_CONNECT_TIMEOUT
             while time.monotonic() < deadline:
-                rc, out, _err = self.vm.exec(
-                    vm_name,
-                    [f"grep -c 'Connected to the server' {self.WAZUH_LOG} 2>/dev/null || true"],
-                )
-                if rc == 0 and out.strip() not in ("", "0"):
+                if self._agent_manager_acked(vm_name):
                     return True
                 time.sleep(self.ENROLL_CONNECT_INTERVAL)
         return False
+
+    def _agent_manager_acked(self, vm_name: str) -> bool:
+        """True when `wazuh-agentd.state` shows the agent connected AND carrying a real
+        `last_ack` — i.e. the manager has acknowledged it, so events actually flow. This
+        distinguishes a working channel from the race where the agent's socket connects
+        but remoted drops its messages (no ACK). `|| true` keeps a no-match grep from
+        surfacing as an exec error."""
+        rc, out, _err = self.vm.exec(
+            vm_name,
+            [
+                f"grep -q \"status='connected'\" {self.WAZUH_STATE} 2>/dev/null && "
+                f"grep -qE \"last_ack='[0-9]\" {self.WAZUH_STATE} 2>/dev/null && echo ACKED || true"
+            ],
+        )
+        return rc == 0 and "ACKED" in out
 
     def _restore_shared_identity(self, vm_name: str) -> None:
         """Put the baked `client.keys` back and reload the agent, so a failed unique
@@ -519,18 +554,23 @@ class LocalAppliance:
     WAZUH_AGENT_AUTH = "/Library/Ossec/bin/agent-auth"
     WAZUH_CLIENT_KEYS = "/Library/Ossec/etc/client.keys"
     WAZUH_OSSEC_CONF = "/Library/Ossec/etc/ossec.conf"
-    WAZUH_LOG = "/Library/Ossec/logs/ossec.log"
+    # The agent writes this every few seconds with its live connection status,
+    # including `last_ack` — the time the MANAGER last acknowledged it.
+    WAZUH_STATE = "/Library/Ossec/var/run/wazuh-agentd.state"
 
-    # After enrolling a unique agent we must WAIT until it has actually connected to
-    # the manager before relying on it to forward — enroll-then-restart races the
-    # manager's remoted key reload, and the agent's own reconnect backoff can be a full
-    # minute, longer than a detonation window. Poll the guest's ossec.log for a fresh
-    # "Connected to the server", and re-kick the agent (a fresh restart forces an
-    # immediate attempt, by which time remoted has the key) rather than wait out that
-    # backoff. Verified live: one enrolled clone forwarded zero alerts while its
-    # neighbors forwarded normally, exactly this race.
-    ENROLL_CONNECT_TIMEOUT = 20.0
-    ENROLL_CONNECT_INTERVAL = 2.0
+    # After enrolling a unique agent we must WAIT until the manager is actually
+    # acknowledging it before relying on it to forward. The trap: enroll-then-restart
+    # races the manager's remoted key reload — remoted accepts the agent's TCP socket
+    # (so the agent logs "Connected to the server") but rejects its messages until it
+    # reloads the just-registered key, silently dropping every event. So the agent-side
+    # "Connected" line is NOT proof the channel works; `wazuh-agentd.state`'s `last_ack`
+    # is (it is set only on a real manager ACK, and stays empty through the race).
+    # Verified live: an enrolled agent that "connected" forwarded zero alerts while a
+    # sibling forwarded normally — exactly this race. If the manager hasn't acked within
+    # the timeout, re-kick the agent (a fresh restart forces an immediate reconnect, by
+    # which time remoted has the key) rather than wait out its ~60 s reconnect backoff.
+    ENROLL_CONNECT_TIMEOUT = 30.0
+    ENROLL_CONNECT_INTERVAL = 3.0
     ENROLL_CONNECT_ATTEMPTS = 3
 
     def _revert_live(self, profile: str) -> None:

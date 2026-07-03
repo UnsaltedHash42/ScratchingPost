@@ -128,20 +128,24 @@ class EnrollFakeVm(FakeVm):
         super().__init__(raw_fixture)
         self.manager = manager
         self.enrolled_name: str | None = None
+        self._restarted = False  # a restart brings the (manager-acked) agent up
 
     def exec(self, vm, argv):
         argv = list(argv)
         if argv and argv[0] == LocalAppliance.WAZUH_AGENT_AUTH and "-A" in argv:
             self.enrolled_name = argv[argv.index("-A") + 1]
+        if argv[:2] == [LocalAppliance.WAZUH_CONTROL, "restart"]:
+            self._restarted = True
         # Manager address read from the guest's own ossec.conf (robust to DHCP).
         if argv and argv[0].startswith("grep -oE '<address>"):
             self.calls.append(("exec", vm, argv))
             return (0, self.manager + "\n", "")
-        # The post-enrollment connection wait polls ossec.log; report connected at once
-        # so unit tests don't incur the real connect-wait timeout.
-        if argv and argv[0].startswith("grep -c 'Connected to the server'"):
+        # The post-enrollment wait polls wazuh-agentd.state for a manager ACK; report
+        # acked once the agent has been restarted so the unit test never incurs the real
+        # connect-wait timeout.
+        if argv and "wazuh-agentd.state" in argv[0] and "ACKED" in argv[0]:
             self.calls.append(("exec", vm, argv))
-            return (0, "1\n", "")
+            return (0, ("ACKED\n" if self._restarted else ""), "")
         # The enrollment verify cats client.keys (distinct from the raw-capture cat).
         if argv and argv[0] == "/bin/cat" and argv[-1].endswith("client.keys"):
             self.calls.append(("exec", vm, argv))
@@ -292,18 +296,25 @@ def test_dispatch_unique_enrollment_registers_and_exposes_run_agent(tmp_path):
         share_root=str(tmp_path / "runs"),
         agent_ingest_path="/var/log/scratchingpost/events.jsonl",
         agent_ingest_settle=0,
+        unique_enrollment=True,  # opt-in (off by default; see the NAT-source-IP caveat)
     )
     run_id = app.detonate(Sample.from_path(str(FIX / "thin_arm64")), "wazuh", timeout=1.0)
+
+    # The unique name derives from the CLONE uuid (unique per run), not the deterministic
+    # run_id — else repeat runs of a sample request the same name and authd rejects the
+    # duplicate. Recover the clone name to compute the expected agent name.
+    clone_name = next(c[2] for c in vm.calls if c[0] == "clone")
+    expected = f"scratchingpost-{clone_name.rsplit('-', 1)[-1]}"
 
     auth = [c[2] for c in vm.calls if c[0] == "exec" and c[2][0] == LocalAppliance.WAZUH_AGENT_AUTH]
     assert auth, "dispatch path should register a unique agent via agent-auth"
     a = auth[0]
     assert a[1:3] == ["-m", "10.0.0.9"]                     # manager from the guest ossec.conf
-    assert a[3] == "-A" and a[4] == f"scratchingpost-{run_id}"  # unique per-run name
+    assert a[3] == "-A" and a[4] == expected               # unique per-run name (clone uuid)
     # The agent is reloaded so it connects under the new key.
     assert ["/Library/Ossec/bin/wazuh-control", "restart"] in [c[2] for c in vm.calls if c[0] == "exec"]
     # ...and the run's name is what the dispatch module will correlate the window by.
-    assert app.agent_name_for(run_id) == f"scratchingpost-{run_id}"
+    assert app.agent_name_for(run_id) == expected
 
 
 def test_unique_enrollment_falls_back_to_shared_identity_without_manager(tmp_path):
@@ -317,6 +328,7 @@ def test_unique_enrollment_falls_back_to_shared_identity_without_manager(tmp_pat
         share_root=str(tmp_path / "runs"),
         agent_ingest_path="/var/log/scratchingpost/events.jsonl",
         agent_ingest_settle=0,
+        unique_enrollment=True,
     )
     run_id = app.detonate(Sample.from_path(str(FIX / "thin_arm64")), "wazuh", timeout=1.0)
     assert app.agent_name_for(run_id) is None
@@ -328,7 +340,8 @@ def test_apple_path_never_enrolls(tmp_path):
     # reads the manager address nor registers.
     vm = FakeVm(ESLOGGER_FIX)
     app = LocalAppliance(live=True, vm=vm, golden_image="golden-apple",
-                         share_root=str(tmp_path / "runs"))
+                         share_root=str(tmp_path / "runs"),
+                         unique_enrollment=True)  # on, but the apple path still must not enroll
     run_id = app.detonate(Sample.from_path(str(FIX / "thin_arm64")), "apple", timeout=1.0)
     assert app.agent_name_for(run_id) is None
     assert not any(

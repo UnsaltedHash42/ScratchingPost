@@ -123,3 +123,25 @@ Two capture-quality knobs are required and set by the wazuh env (both default of
 #  3. /Library/Ossec/bin/wazuh-control restart
 #  4. confirm: grep "Analyzing file: '/var/log/scratchingpost/events.jsonl'" /Library/Ossec/logs/ossec.log
 ```
+
+## Agent identity: shared (default) vs per-clone unique
+
+Every clone reuses the golden's baked `client.keys` (agent id 001,
+`scratchingpost-wazuh.shared`), correlated by time window + agent name. This is the
+**default and the reliable path**, with two caveats handled in code (`_sync_guest_clock`,
+graceful agent stop before clone delete) plus one operational rule: a stale id-001 remoted
+connection inherited at session start zeroes the dispatch tier, so **restart the manager
+daemons once before the first live run of a session**
+(`docker exec single-node-wazuh.manager-1 /var/ossec/bin/wazuh-control restart`).
+
+`LocalAppliance(unique_enrollment=True)` (**default False**) instead enrolls each clone as
+its own agent — `agent-auth -A scratchingpost-<clone-uuid>` (manager address read from the
+guest's own `ossec.conf`), correlated by `agent_name_for(run_id)` — which removes the
+shared-id collision at the root. It registers, correlates, and forwards correctly in
+isolation, **but is not yet reliable in the wazuh-docker lab**: every Parallels clone NATs to
+the Dockerized manager through one source IP (`192.168.65.1`), and `remoted` intermittently
+(~1 run in 3) rejects a freshly-enrolled agent from that shared IP (`Invalid ID N for source
+ip ...`) so it never connects and forwards nothing. The durable fix is **per-clone routable
+identity** (bridged per-clone networking, or a non-Dockerized manager so each guest reaches
+`remoted` as itself) — infrastructure, not guest-side retry. Enable `unique_enrollment=True`
+only in an environment without the shared-source-IP race.

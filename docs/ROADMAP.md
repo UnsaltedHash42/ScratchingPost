@@ -64,6 +64,16 @@ this becomes genuinely useful. Be honest about these when planning:
    connection and back-to-back runs forwarded nothing — fixed by gracefully stopping the in-guest
    agent before deleting the clone (`_revert_live`). See the `wazuh-dispatch-reliability` memory.
 
+   **The residual shared-id-001 gotcha** (a stale connection inherited at session start) still needs
+   a one-time manager-daemon restart before the first live run, and that is the current operational
+   rule. **Session 8 built per-clone unique agent enrollment** (`LocalAppliance.unique_enrollment`,
+   `agent-auth -A scratchingpost-<clone-uuid>`, correlate by `agent_name_for`) to remove that gotcha
+   at the root, but it is **OFF by default and not yet reliable**: all Parallels clones NAT to the
+   Dockerized manager through one source IP, and remoted intermittently (~1 run in 3) rejects a
+   freshly-enrolled agent from that shared IP so it never connects. The durable fix is per-clone
+   routable identity (bridged networking / non-Dockerized manager) — infra, not app code. Until then
+   the shared identity + graceful-stop + session-start restart is the reliable path.
+
 4. **Not portable.** Despite the hypervisor-agnostic design, it's welded to one specific Mac +
    Parallels + a hand-built golden image. The golden build and guest provisioning are manual;
    "download and run" is far off.
@@ -146,9 +156,11 @@ verdict + a Detection Score + a report, with the detonation env reverting betwee
   the **persistence** rule 100010 (T1543.001, session 6) and the **injection** rule 100001 (T1055,
   `task_for_pid`, session 7) end to end — the sandbox convicts real behavior, not just an unsigned
   exec. Two live-only reliability bugs that were zeroing the dispatch tier (guest clock skew,
-  shared-agent-identity collision) are also fixed. **Remaining:** rules that need a real implant to
-  *act* over a live channel — build the interactive/live-callback detonation mode (task a Poseidon
-  beacon; needs the http listener reachable from the guest + a window longer than 12 s).
+  shared-agent-identity collision) are also fixed; per-clone unique agent enrollment (session 8)
+  would close the residual shared-id-001 gotcha but is off by default, blocked by a NAT-single-IP
+  remoted race (see the "Where it stands" reliability note). **Remaining:** rules that need a real
+  implant to *act* over a live channel — build the interactive/live-callback detonation mode (task a
+  Poseidon beacon; needs the http listener reachable from the guest + a window longer than 12 s).
 - **[NOT STARTED] Elastic offline emulation module.** Run Elastic's protections-artifacts YARA +
   behavioral rules against your telemetry, offline, no VM. (Verify current repo layout at build.)
 - **[NOT STARTED] Memory / injection scanner (standalone + module).** Walk a live process's VM
